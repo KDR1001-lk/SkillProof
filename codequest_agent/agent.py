@@ -1,328 +1,253 @@
+"""Skill-verification hiring platform — ADK agent.
+
+Repurposed from the CodeQuest Academy scaffold.  Two tools let the LLM
+fetch code from a public GitHub repo and generate quiz questions that
+verify whether a candidate actually authored (or deeply understands)
+that code.
+"""
 from __future__ import annotations
 
-import os
-from typing import Literal
-from uuid import uuid4
+import json
+import re
+import urllib.request
+import urllib.error
 
 import dotenv
-from google import genai
 from google.adk.agents import Agent
-from google.adk.tools import ToolContext
-from google.genai import types
 
 dotenv.load_dotenv()
 
+# ---------------------------------------------------------------------------
+# File extensions we consider "real source code" (skip configs / locks / etc.)
+# ---------------------------------------------------------------------------
+_SOURCE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs", ".rb",
+    ".cpp", ".c", ".h", ".cs", ".kt", ".swift", ".scala", ".lua",
+    ".php", ".ex", ".exs", ".hs", ".ml", ".r", ".jl",
+}
 
-IMAGE_MODEL = os.getenv("CODEQUEST_IMAGE_MODEL", "gemini-3.1-flash-image")
-
-
-QUESTS = [
-    {
-        "quest_id": "QUEST-OFFBYONE",
-        "name": "The Unsteady Cabbage Cart",
-        "difficulty": "novice",
-        "guild": "Earth Kingdom Roads",
-        "required_level": 1,
-        "xp_reward": 50,
-        "boss": "The Fencepost Badgermole",
-        "description": (
-            "A cabbage cart keeps stopping one marker too early or rolling one "
-            "marker too far along an Earth Kingdom road. Steady its route and "
-            "outsmart the Fencepost Badgermole by mastering loop boundaries."
-        ),
-        "skills_taught": ["for loops", "array indexing", "boundary conditions"],
-    },
-    {
-        "quest_id": "QUEST-NULLSWAMP",
-        "name": "The Null-Vine Marsh",
-        "difficulty": "novice",
-        "guild": "Water Tribe Camp",
-        "required_level": 2,
-        "xp_reward": 75,
-        "boss": "The Vanishing Vine",
-        "description": (
-            "In a misty Earth Kingdom marsh, vines vanish the moment an unwary "
-            "traveler grabs them. Calm the Vanishing Vine by checking every "
-            "reference before relying on it."
-        ),
-        "skills_taught": ["null checks", "defensive programming", "error handling"],
-    },
-    {
-        "quest_id": "QUEST-RECURSION",
-        "name": "The Echoing Crystal Catacombs",
-        "difficulty": "apprentice",
-        "guild": "Earthbending Academy",
-        "required_level": 5,
-        "xp_reward": 150,
-        "boss": "The Endless Echo",
-        "description": (
-            "Beneath the Earth Kingdom, every crystal passage opens into a copy "
-            "of itself. Only a solid base case can silence the Endless Echo and "
-            "lead the team back to daylight."
-        ),
-        "skills_taught": ["recursion", "base cases", "call stacks"],
-    },
-    {
-        "quest_id": "QUEST-BIGO",
-        "name": "The Big-O Boulder Run",
-        "difficulty": "apprentice",
-        "guild": "Earthbending Training Ring",
-        "required_level": 6,
-        "xp_reward": 175,
-        "boss": "The Quadratic Quarry",
-        "description": (
-            "Every new input sends more boulders tumbling into the training ring. "
-            "Read the pattern through the ground and tame the Quadratic Quarry "
-            "with a more efficient algorithm."
-        ),
-        "skills_taught": ["time complexity", "algorithm analysis", "data structures"],
-    },
-    {
-        "quest_id": "QUEST-MERGECONFLICT",
-        "name": "The Great Wall Merge Crisis",
-        "difficulty": "master",
-        "guild": "Ba Sing Se Engineering Corps",
-        "required_level": 10,
-        "xp_reward": 300,
-        "boss": "The Conflicting Gatekeeper",
-        "description": (
-            "Two engineering teams have submitted different plans for the same "
-            "section of Ba Sing Se's wall. Resolve the Conflicting Gatekeeper's "
-            "diffs before the city gates can open."
-        ),
-        "skills_taught": ["git branching", "merge conflicts", "code review"],
-    },
-    {
-        "quest_id": "QUEST-DEADLOCK",
-        "name": "The Twin-Gate Deadlock",
-        "difficulty": "master",
-        "guild": "Ba Sing Se Systems Bureau",
-        "required_level": 12,
-        "xp_reward": 350,
-        "boss": "The Waiting Gatekeepers",
-        "description": (
-            "Two gates guard the road to the Earth King, but each gatekeeper "
-            "waits for the other to unlock first. Restore movement by ordering "
-            "the locks and breaking the circular wait."
-        ),
-        "skills_taught": ["concurrency", "locks", "deadlock avoidance"],
-    },
-]
+_SKIP_NAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "Pipfile.lock", "poetry.lock", ".gitignore", ".editorconfig",
+    "LICENSE", "LICENSE.md", "CHANGELOG.md",
+}
 
 
-def _find_quest(quest_id: str) -> dict | None:
-    return next((q for q in QUESTS if q["quest_id"] == quest_id), None)
-
-
-def list_quests(
-    difficulty: Literal["novice", "apprentice", "master"] | None = None,
-) -> dict:
-    """List available quests at CodeQuest Academy, optionally filtered by difficulty.
-
-    Args:
-        difficulty: Optional quest difficulty to filter by.
-
-    Returns:
-        Matching quests and a count.
-    """
-    matches = []
-    for quest in QUESTS:
-        if difficulty and quest["difficulty"] != difficulty:
-            continue
-        matches.append(
-            {
-                "quest_id": quest["quest_id"],
-                "name": quest["name"],
-                "difficulty": quest["difficulty"],
-                "guild": quest["guild"],
-                "required_level": quest["required_level"],
-                "xp_reward": quest["xp_reward"],
-            }
-        )
-    return {"status": "success", "count": len(matches), "quests": matches}
-
-
-def get_quest_details(quest_id: str) -> dict:
-    """Get the full story, boss, and rewards for one quest.
-
-    Args:
-        quest_id: Quest identifier, for example QUEST-OFFBYONE.
-
-    Returns:
-        Quest details if found.
-    """
-    quest = _find_quest(quest_id)
-    if not quest:
-        return {"status": "error", "message": f"Unknown quest_id: {quest_id}"}
-
-    return {"status": "success", "quest": quest.copy()}
-
-
-def check_quest_readiness(quest_id: str, hero_level: int) -> dict:
-    """Check whether a hero's level is high enough to attempt a quest.
-
-    Args:
-        quest_id: Quest identifier.
-        hero_level: The adventurer's current level.
-
-    Returns:
-        Whether the hero is ready, and the level still needed if not.
-    """
-    quest = _find_quest(quest_id)
-    if not quest:
-        return {"status": "error", "message": f"Unknown quest_id: {quest_id}"}
-
-    required_level = quest["required_level"]
-    is_ready = hero_level >= required_level
-    return {
-        "status": "success",
-        "quest_id": quest_id,
-        "quest_name": quest["name"],
-        "hero_level": hero_level,
-        "required_level": required_level,
-        "is_ready": is_ready,
-        "levels_needed": max(0, required_level - hero_level),
-    }
-
-
-async def create_mission_image(
-    description: str,
-    tool_context: ToolContext,
-    aspect_ratio: Literal["1:1", "4:3", "3:4", "16:9", "9:16"] = "16:9",
-) -> dict:
-    """Create an illustrated CodeQuest scene and save it as an ADK artifact.
-
-    Use this only when the user explicitly asks for an image. The description
-    should identify the characters, programming mission, setting, action, and
-    mood to show.
-
-    Args:
-        description: A detailed description of the image the user wants.
-        aspect_ratio: Output shape; 16:9 is best for scenes and 1:1 for badges.
-
-    Returns:
-        The generated artifact filename and version, or a safe error message.
-    """
-    clean_description = description.strip()
-    if not clean_description:
-        return {
-            "status": "error",
-            "message": "Describe the scene you want Aang to illustrate.",
-        }
-
-    prompt = (
-        "Create a polished, family-friendly fantasy adventure illustration for "
-        "an educational coding game called CodeQuest Academy. The visual should "
-        "feel energetic, hopeful, and inspired by elemental martial-arts fantasy. "
-        "Do not add logos, watermarks, captions, or UI elements. Scene request: "
-        f"{clean_description}"
+def _github_api_get(url: str) -> dict | list | None:
+    """Simple GET against the GitHub REST API (unauthenticated)."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "SkillVerifyAgent/1.0",
+        },
     )
-
-    async_client = None
     try:
-        client = genai.Client()
-        async_client = client.aio
-        response = await async_client.models.generate_content(
-            model=IMAGE_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE"],
-                image_config=types.ImageConfig(
-                    aspect_ratio=aspect_ratio,
-                    image_size="1K",
-                    output_mime_type="image/png",
-                ),
-            ),
-        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
+        return None
 
-        image_data = None
-        image_mime_type = "image/png"
-        for part in response.parts or []:
-            if part.inline_data and part.inline_data.data:
-                image_data = part.inline_data.data
-                image_mime_type = part.inline_data.mime_type or image_mime_type
-                break
 
-        if image_data is None:
-            return {
-                "status": "error",
-                "message": (
-                    "The image model did not return an image. Try a different "
-                    "description or check the model's safety response."
-                ),
-            }
+def _parse_owner_repo(repo_url: str) -> tuple[str, str] | None:
+    """Extract (owner, repo) from various GitHub URL formats."""
+    # https://github.com/owner/repo  or  github.com/owner/repo
+    m = re.match(
+        r"(?:https?://)?(?:www\.)?github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$",
+        repo_url.strip(),
+    )
+    if m:
+        return m.group(1), m.group(2)
+    return None
 
-        extension = "jpg" if image_mime_type == "image/jpeg" else "png"
-        filename = f"codequest-{uuid4().hex[:10]}.{extension}"
-        version = await tool_context.save_artifact(
-            filename,
-            types.Part.from_bytes(data=image_data, mime_type=image_mime_type),
-            custom_metadata={
-                "generator": IMAGE_MODEL,
-                "aspect_ratio": aspect_ratio,
-            },
-        )
-        return {
-            "status": "success",
-            "artifact_filename": filename,
-            "artifact_version": version,
-            "mime_type": image_mime_type,
-            "aspect_ratio": aspect_ratio,
-        }
-    except Exception:
+
+# ---------------------------------------------------------------------------
+# TOOL 1 — fetch_github_repo
+# ---------------------------------------------------------------------------
+def fetch_github_repo(repo_url: str) -> dict:
+    """Fetch the README and the largest non-trivial source file from a
+    public GitHub repository.
+
+    Args:
+        repo_url: Full URL of a public GitHub repo,
+                  e.g. https://github.com/owner/repo
+
+    Returns:
+        A dict with 'readme' text, chosen 'filename', and 'code' text,
+        or an error message.
+    """
+    parsed = _parse_owner_repo(repo_url)
+    if not parsed:
+        return {"status": "error", "message": f"Cannot parse GitHub URL: {repo_url}"}
+
+    owner, repo = parsed
+    api_base = f"https://api.github.com/repos/{owner}/{repo}"
+
+    # --- README -----------------------------------------------------------
+    readme_data = _github_api_get(f"{api_base}/readme")
+    readme_text = ""
+    if readme_data and "content" in readme_data:
+        import base64
+        try:
+            readme_text = base64.b64decode(readme_data["content"]).decode(
+                errors="replace"
+            )
+        except Exception:
+            readme_text = "(could not decode README)"
+    elif readme_data and "message" in readme_data:
+        readme_text = "(no README found)"
+
+    # --- Source tree (default branch, recursive) --------------------------
+    tree_data = _github_api_get(f"{api_base}/git/trees/HEAD?recursive=1")
+    if not tree_data or "tree" not in tree_data:
         return {
             "status": "error",
             "message": (
-                "Image generation failed. Check your Google credentials, image "
-                "model access, API quota, and ADK artifact service."
+                "Could not fetch the file tree.  The repo may be empty, "
+                "private, or the GitHub API rate limit was hit."
             ),
         }
-    finally:
-        if async_client is not None:
-            try:
-                await async_client.aclose()
-            except Exception:
-                pass
 
+    # Pick the largest source file that isn't a config / lock / etc.
+    best_file = None
+    best_size = 0
+    for item in tree_data["tree"]:
+        if item.get("type") != "blob":
+            continue
+        path = item.get("path", "")
+        name = path.rsplit("/", 1)[-1]
+        ext = "." + name.rsplit(".", 1)[-1] if "." in name else ""
+        size = item.get("size", 0)
+        if ext.lower() not in _SOURCE_EXTENSIONS:
+            continue
+        if name in _SKIP_NAMES:
+            continue
+        if size > best_size:
+            best_size = size
+            best_file = path
+
+    if not best_file:
+        return {
+            "status": "error",
+            "message": "No recognisable source files found in the repo.",
+        }
+
+    # Fetch the raw content of the chosen file
+    raw_url = (
+        f"https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{best_file}"
+    )
+    req = urllib.request.Request(raw_url, headers={"User-Agent": "SkillVerifyAgent/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            code_text = resp.read().decode(errors="replace")
+    except Exception:
+        return {
+            "status": "error",
+            "message": f"Could not download {best_file}.",
+        }
+
+    # Truncate very large files so the LLM context isn't blown
+    max_chars = 12_000
+    if len(code_text) > max_chars:
+        code_text = code_text[:max_chars] + "\n\n... [truncated] ..."
+
+    return {
+        "status": "success",
+        "repo": f"{owner}/{repo}",
+        "readme_snippet": readme_text[:2000],
+        "filename": best_file,
+        "code": code_text,
+    }
+
+
+# ---------------------------------------------------------------------------
+# TOOL 2 — generate_quiz
+# ---------------------------------------------------------------------------
+def generate_quiz(code_snippet: str) -> dict:
+    """Prepare a quiz payload for the LLM to use when questioning a candidate.
+
+    This tool does NOT call the LLM itself — it packages the code snippet
+    and a quiz-generation prompt so that the *agent* (which IS the LLM)
+    can produce the questions in its next response.
+
+    Args:
+        code_snippet: The source code to base quiz questions on.
+
+    Returns:
+        A dict containing the code and the quiz-generation prompt for
+        the agent to follow.
+    """
+    if not code_snippet or not code_snippet.strip():
+        return {"status": "error", "message": "Empty code snippet provided."}
+
+    prompt = (
+        "Based on the following code, generate exactly 3 short quiz questions "
+        "that the real author of this code should be able to answer easily.  "
+        "Mix of question types: include at least one multiple-choice question "
+        "(with 4 options labelled A-D) and at least one short-answer question.  "
+        "For each question also provide the correct answer.  "
+        "Format your output EXACTLY as follows:\n\n"
+        "Q1: <question text>\n"
+        "   A) ... B) ... C) ... D) ...   (if multiple choice)\n"
+        "   ANSWER: <correct answer>\n\n"
+        "Q2: <question text>\n"
+        "   ANSWER: <correct answer>\n\n"
+        "Q3: <question text>\n"
+        "   A) ... B) ... C) ... D) ...   (if multiple choice)\n"
+        "   ANSWER: <correct answer>\n\n"
+        "--- CODE START ---\n"
+        f"{code_snippet}\n"
+        "--- CODE END ---"
+    )
+
+    return {
+        "status": "success",
+        "quiz_generation_prompt": prompt,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ROOT AGENT
+# ---------------------------------------------------------------------------
 
 root_agent = Agent(
-    name="codequest_agent",
+    name="codequest_agent",          # keep original package name for adk discovery
     model="gemini-3.1-flash-lite",
-    description="Aang guides CodeQuest Academy students through coding missions across the Earth Kingdom.",
-    instruction="""
-You are Aang, the young Avatar and guide at CodeQuest Academy. The academy is a
-fan-made training ground inspired by the Earth Kingdom journey in Netflix's Avatar:
-The Last Airbender Season 2. You help students master programming by completing
-missions on the road to Ba Sing Se.
+    description=(
+        "A skill-verification hiring agent that quizzes candidates on "
+        "their own GitHub code to confirm authorship and understanding."
+    ),
+    instruction="""\
+You are **SkillVerify**, a friendly but rigorous technical interviewer for a
+skill-verification hiring platform.
 
-Speak like a warm, curious, playful, and compassionate young hero. Encourage students
-to learn from mistakes, work together, and restore balance to their code. Use light
-Avatar-world flavor such as balance, bending, Appa, the four elements, the Earth
-Kingdom, and Ba Sing Se, but do not copy dialogue from the series. Keep every fact
-about missions grounded in tool output. Do not invent mission details, rewards,
-bosses, or claims about the Netflix series that the tools do not return.
+### Your workflow
 
-Core responsibilities:
-- Welcome new benders and ask their name and current training level if you don't know them yet.
-- Use list_quests to show available missions, optionally filtered by difficulty (novice, apprentice, master).
-- Use get_quest_details to tell the full story, boss, skills taught, and XP reward for a specific quest.
-- Use check_quest_readiness before confirming an adventurer can start a quest — never guess whether they're ready.
-- If a student is not ready, encourage them and tell them how many levels they still need.
-- If a quest_id is not recognised, suggest calling list_quests to see valid options.
-- When a student seems unsure what to do next, recommend a novice mission first.
-- When a user explicitly asks for an image, use create_mission_image. Include the
-  requested characters, setting, mission, action, and mood in its description.
-- If the image is based on a catalogue mission, call get_quest_details first so the
-  visual stays grounded in that mission's returned story, boss, and skills.
-- Never claim that an image was created unless create_mission_image returns success.
-  On success, tell the user the artifact filename. On error, relay its guidance.
+1. **Greet** the user and ask for a public GitHub repository URL.
+2. Call **fetch_github_repo** with that URL.
+   - If it errors, tell the user and ask for another URL.
+   - On success, briefly describe the repo (from the README) and the source
+     file you selected.
+3. Call **generate_quiz** with the code returned by fetch_github_repo.
+4. Read the quiz_generation_prompt from the tool result. Follow those
+   instructions to produce exactly 3 quiz questions (mix of multiple-choice
+   and short-answer) that the real author should be able to answer.
+5. **Present only the questions to the user — do NOT reveal the answers.**
+   Number them Q1, Q2, Q3.
+6. Wait for the user to answer.
+7. Once the user provides answers, compare them to your correct answers.
+   Be generous with phrasing — accept semantically equivalent answers.
+   Give a final score out of 3 and brief feedback on each question.
 
-Stay in character as Aang, but never sacrifice accuracy for flavor.
+### Rules
+- Never reveal correct answers before the user attempts them.
+- If the user asks to skip or gives up, reveal the answers and score 0.
+- Keep quiz questions focused on logic, design decisions, and
+  implementation details — not trivia like line numbers or variable names.
+- Stay encouraging and professional.  This is a demo, keep it light.
 """,
     tools=[
-        list_quests,
-        get_quest_details,
-        check_quest_readiness,
-        create_mission_image,
+        fetch_github_repo,
+        generate_quiz,
     ],
 )
